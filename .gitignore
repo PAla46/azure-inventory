@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+azure_inventory_env/
+
+# Generated inventory outputs
+azure_inventory_*.csv
+azure_inventory_*.xlsx
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
