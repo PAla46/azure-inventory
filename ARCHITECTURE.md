@@ -94,8 +94,8 @@ get_arg_client() ── ResourceGraphClient(credential)
     │
     ▼
 [Phase 3a] fetch_subscription_metadata()     ──► sub_names{}, sub_mg{}
-[Phase 3b] fetch_diagnostic_parent_ids()     ──► diag_parents{}
-[Phase 3c] fetch_backup_source_ids()         ──► backup_ids{}
+[Phase 3b] fetch_logging_signals()           ──► logging_map{} + agent_monitored{}
+[Phase 3c] fetch_backup_map()                ──► backup_labels{}
 [Phase 3d] fetch_policy_compliance()         ──► policy{rid → states}
     │
     ▼
@@ -124,7 +124,9 @@ editable without touching logic code:
 | `CATEGORY_MAP` | Provider namespace → business category |
 | `REGION_MAP` | Region slug → display name (`eastus2` → `East US 2`) |
 | `ENV_HINTS` | Ordered `(regex, label)` pairs for environment inference |
-| `SUBNET_RE` / `NSG_RE` / `SOURCE_RESOURCE_ID_RE` | Compiled extractors over serialized JSON |
+| `DIAG_CAPABLE_PREFIXES` | Types probed for diagnostic settings (see §7.2) |
+| `PLATFORM_BACKUP` | Services with always-on platform backups (see §7.3) |
+| `SUBNET_RE` / `NSG_RE` / `ARM_ID_RE` | Compiled extractors over structured properties |
 
 Runtime toggles come from argparse:
 
@@ -268,38 +270,81 @@ Tenant Root Group > platform-prod > landingzone-corp
 so the single **Management Group** column carries full lineage without needing
 the Management Groups REST API.
 
-### 7.2 Diagnostic settings (logging posture)
+### 7.2 Logging signals (three independent sources)
 
-```kql
-resources | where type =~ 'microsoft.insights/diagnosticsettings' | project id
+> **Why not Resource Graph?** ARG does **not** index
+> `microsoft.insights/diagnosticSettings` (an extension child resource) — a
+> Graph query for it returns zero rows on any tenant. The first version of this
+> script relied on exactly that and reported "Not detected" everywhere. The
+> logging column therefore aggregates three signals that actually work:
+
+**Signal 1 — Diagnostic settings via Azure Monitor API (threaded probe).**
+Resources whose type appears in `DIAG_CAPABLE_PREFIXES` (~35 families: storage,
+KV, SQL servers + databases, web apps, NSGs, firewalls, gateways, AKS, ACR,
+service bus, event hubs, Cosmos, Redis, workspaces, App Insights, vaults, VMs…)
+are probed with `MonitorManagementClient.diagnostic_settings.list(resource_uri)`
+through a `ThreadPoolExecutor` (`--workers`, default 8). Extension rows and
+child noise are excluded by `_diag_eligible`. Each returned setting is
+classified by whether any *log* category or *metric* category is enabled:
+
+```
+any logs enabled     →  "Diagnostic settings (logs)"
+else any metrics     →  "Diagnostic settings (metrics only)"
+setting w/o categories → ignored
 ```
 
-Diagnostic settings are *extension resources* whose IDs embed their parent:
+The best label per resource wins (logs beats metrics-only).
+
+**Signal 2 — Data collection rules (AMA era).** For the same resources the
+client's `data_collection_rule_associations.list_by_resource()` is consulted
+(guarded by `hasattr` so older SDK versions degrade cleanly). Association
+presence ⇒ `"Data collection rule (monitor agent)"`.
+
+**Signal 3 — Monitoring agents already in the inventory.** Because the main
+Graph query already fetched every VM extension row, `detect_agent_monitored`
+scans those rows locally for known agent names/publishers
+(`AzureMonitorLinuxAgent`, `AzureMonitorWindowsAgent`, `OMSAgentForLinux`,
+`MicrosoftMonitoringAgent`, `DependencyAgent`,
+`Microsoft.EnterpriseCloud.Monitoring`) and credits the parent VM via the
+parent-ID parser. Zero extra API calls.
+
+`enrich` composes all three, e.g.
+`"Diagnostic settings (logs) + Monitoring agent extension"`, or
+`Not detected`.
+
+### 7.3 Backup coverage (three-layer resolution)
+
+ARG also fails to expose `vaults/backupProtectedItems` reliably (zero rows on
+real tenants), so backup truth is assembled from three layers:
+
+**Layer 1 — Restore point collections (Graph, free).** Azure Backup materializes
+a `Microsoft.Compute/restorePointCollections` resource per protected VM/disk,
+and its properties embed the *source* resource ID. One extra Graph query over
+those rows feeds every property blob through `collect_arm_ids` — a recursive
+walker that harvests **all** ARM-ID-shaped strings from parsed JSON (handles
+`sourceResourceId`, `virtualMachineId`, nested lists, arbitrary schemas).
+
+**Layer 2 — Vault scan (authoritative).** For each Recovery Services vault
+already present in the inventory rows, the Backup Management API
+(`RecoveryServicesBackupClient.backup_protected_items.list`) is queried in a
+thread pool. This returns every protected item — IaaS VMs, **disks**, **SQL
+in-VM databases**, SAP HANA, file shares — with its workload type. Source IDs
+are extracted with the same walker and stored as labels like
+`"Azure Backup (AzureDisk)"` / `"Azure Backup (MAB)"`. Failures are isolated
+per vault.
+
+**Layer 3 — Platform-native backups.** Some services are always backed up by
+the platform and never appear in a vault; `PLATFORM_BACKUP` maps them to
+explicit labels:
 
 ```
-/subscriptions/S/resourceGroups/G/providers/Microsoft.KeyVault/vaults/kv
-    /providers/microsoft.insights/diagnosticsettings/diag1
-└────────────── parent ────────────────────────────────────┘
+SQL databases (PaaS & MI)   → Built-in PITR (platform backups)
+Cosmos DB accounts          → Automatic backups (platform)
+PostgreSQL/MySQL Flexible   → Automated backups (platform)
 ```
 
-A single regex strips the extension suffix, yielding the parent resource ID;
-parents land in a lowercase set `diag_parents`. During enrichment, membership
-⇒ `Diagnostic settings enabled`. This is how per-resource logging status is
-answered in **one query** instead of N Monitor API calls.
-
-### 7.3 Backup coverage (Recovery Services)
-
-```kql
-resources | where type =~ 'microsoft.recoveryservices/vaults/backupprotecteditems'
-| project id, properties
-```
-
-Protected items carry the *protected workload's* ARM ID inside `properties`
-(`sourceResourceId`, or `virtualMachineId` for IaaS VM workloads). Rather than
-trusting specific property names across the many protected-item schemas, the
-fetcher runs `SOURCE_RESOURCE_ID_RE` over the serialized JSON and harvests
-**every** `/subscriptions/...` string found — schema-proof by construction.
-Results normalize into lowercase set `backup_ids`.
+Enrichment priority: explicit vault protection → platform-native →
+`Recovery Services vault` (for vault rows themselves) → `N/A`.
 
 ### 7.4 Policy compliance
 
@@ -526,10 +571,14 @@ introduced services with CMK idioms still light up without script changes.
 Pure set-membership against Phase-3 results:
 
 ```
-Logging:  rid ∈ diag_parents  → "Diagnostic settings enabled" | "Not detected"
-Backup:   rid ∈ backup_ids    → "Protected (Azure Backup)"
-          rid is a vault      → "Recovery Services vault"
-          otherwise           → N/A
+Logging:  logging_map[rid] → "Diagnostic settings (logs)" / "(metrics only)"
+                            / "Data collection rule (monitor agent)"
+          rid ∈ agent_monitored → append " + Monitoring agent extension"
+          none of the above → "Not detected"
+Backup:   rid ∈ backup_labels → "Azure Backup (<workload>)"
+          type ∈ PLATFORM_BACKUP → "Built-in PITR (platform backups)" etc.
+          vault row → "Recovery Services vault"
+          otherwise → N/A
 ```
 
 ---
@@ -561,6 +610,9 @@ Cloud Shell minimal images degrade gracefully.
 |---|---|---|
 | ARG payload too large / 429 | halve page size, retry (§6.3) | latency only |
 | Aux query throws (policy perms, etc.) | caught in `main()` → warn, continue | single column = N/A |
+| Per-vault backup probe fails | isolated per vault in the thread pool | that vault's items missing |
+| Diag probe fails on a resource | silently counted as no-signal | resource shows Not detected |
+| Monitor SDK lacks DCR API | `hasattr` guard skips signal 2 | fewer logging labels |
 | Malformed row during enrichment | per-row try/except → skipped with stderr note | one resource missing |
 | Map-building anomaly | swallowed per-row in `build_network_ctx` | missing edges only |
 | No credentials available | exception surfaces with SDK message | clean abort pre-query |
@@ -596,8 +648,8 @@ Only a total failure of the primary query aborts the run.
 | 31 | Tag Compliance Status | computed | `tag_compliance` |
 | 32 | Policy Compliance | policyresources | `fetch_policy_compliance` |
 | 33 | Encryption Status | computed | `encryption_status` |
-| 34 | Logging & Monitoring | diagnosticsettings | `fetch_diagnostic_parent_ids` |
-| 35 | Backup / Recovery | backupprotecteditems | `fetch_backup_source_ids` |
+| 34 | Logging & Monitoring | Monitor API + DCR + agent scan | `fetch_logging_signals`, `detect_agent_monitored` |
+| 35 | Backup / Recovery | RPCs + vault API + platform map | `fetch_backup_map`, `PLATFORM_BACKUP` |
 | 36 | Inventory Last Refreshed | run clock | constant per run |
 
 ---
@@ -645,17 +697,21 @@ at 100k resources, comfortably inside Cloud Shell limits.
 1. **VM power state** — Graph doesn't index `instanceView`; stopped/deallocated
    VMs still report `Succeeded`. Would require per-VM compute calls (rejected
    for scale reasons).
-2. **Diagnostic-setting destinations** — presence/absence only; whether logs
-   actually reach a workspace isn't verified.
+2. **Diagnostic-setting destinations** — the probe classifies log vs metric
+   categories, but doesn't verify data actually reaches the workspace; DCR
+   coverage depends on the installed `azure-mgmt-monitor` version.
 3. **Public-access heuristics** — types outside the decision table report
    `N/A`; WAF/Firewall frontends aren't traced.
 4. **Policy freshness** — policy states reflect Graph's indexed snapshot
    (typically ≤ 15 min behind live evaluation).
 5. **Tag regex collisions** — first-match-wins means an org using `owner` for
    technical owners will populate Business Owner instead; tune patterns.
-6. **Extension resources** (diagnosticSettings etc.) appear as inventory rows
-   themselves since they're in `resources`; they're harmless noise with valid
-   parents shown.
+6. **Extension resources** (VM extensions etc.) appear as inventory rows
+   themselves since they're in `resources`; harmless noise with valid parents.
+7. **Logging probe surface** — only types listed in `DIAG_CAPABLE_PREFIXES`
+   are probed for diagnostic settings; exotic types may be missed, and the
+   probe adds ~1 API call per eligible resource (tune with `--workers` or skip
+   via `--skip-logging`).
 
 ---
 

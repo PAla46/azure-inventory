@@ -21,8 +21,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 N_A = "N/A"
@@ -238,6 +240,63 @@ ENV_HINTS = [
     (r"\b(demo|poc|prototype)\b", "PoC/Demo"),
 ]
 
+# Resource types whose URI supports /providers/microsoft.insights/diagnosticSettings.
+DIAG_CAPABLE_PREFIXES = (
+    "microsoft.storage/storageaccounts",
+    "microsoft.keyvault/vaults",
+    "microsoft.sql/servers",
+    "microsoft.sql/managedinstances",
+    "microsoft.web/sites",
+    "microsoft.network/networksecuritygroups",
+    "microsoft.network/applicationgateways",
+    "microsoft.network/azurefirewalls",
+    "microsoft.network/virtualnetworkgateways",
+    "microsoft.network/expressroutecircuits",
+    "microsoft.containerservice/managedclusters",
+    "microsoft.containerregistry/registries",
+    "microsoft.servicebus/namespaces",
+    "microsoft.eventhub/namespaces",
+    "microsoft.relay/namespaces",
+    "microsoft.documentdb/databaseaccounts",
+    "microsoft.cache/redis",
+    "microsoft.operationalinsights/workspaces",
+    "microsoft.insights/components",
+    "microsoft.logic/workflows",
+    "microsoft.apimanagement/service",
+    "microsoft.search/searchservices",
+    "microsoft.devices/iothubs",
+    "microsoft.kusto/clusters",
+    "microsoft.databricks/workspaces",
+    "microsoft.synapse/workspaces",
+    "microsoft.datafactory/factories",
+    "microsoft.streamanalytics/streamingjobs",
+    "microsoft.batch/batchaccounts",
+    "microsoft.automation/automationaccounts",
+    "microsoft.cognitiveservices/accounts",
+    "microsoft.appconfiguration/configurationstores",
+    "microsoft.purview/accounts",
+    "microsoft.recoveryservices/vaults",
+    "microsoft.compute/virtualmachines",
+)
+
+# Services that are always backed up by the platform itself, no vault involved.
+PLATFORM_BACKUP = {
+    "microsoft.sql/servers/databases": "Built-in PITR (platform backups)",
+    "microsoft.sql/managedinstances/databases": "Built-in PITR (platform backups)",
+    "microsoft.documentdb/databaseaccounts": "Automatic backups (platform)",
+    "microsoft.dbforpostgresql/flexibleservers": "Automated backups (platform)",
+    "microsoft.dbformysql/flexibleservers": "Automated backups (platform)",
+}
+
+MONITOR_AGENT_MARKERS = (
+    "azuremonitorlinuxagent",
+    "azuremonitorwindowsagent",
+    "omsagentforlinux",
+    "microsoftmonitoringagent",
+    "dependencyagent",
+)
+MONITOR_PUBLISHERS = ("microsoft.enterprisecloud.monitoring",)
+
 SUBNET_RE = re.compile(
     r"/subscriptions/[^\"\s]+/resourceGroups/[^\"\s]+"
     r"/providers/Microsoft\.Network/virtualNetworks/[^\"\s/]+"
@@ -249,7 +308,26 @@ NSG_RE = re.compile(
     r"/providers/Microsoft\.Network/networkSecurityGroups/[^\"\s/]+",
     re.I,
 )
-SOURCE_RESOURCE_ID_RE = re.compile(r'"sourceResourceId"\s*:\s*"([^"]+)"', re.I)
+ARM_ID_RE = re.compile(r"^/subscriptions/[^/]+/(?:resourceGroups/[^/]+/)?providers/.+", re.I)
+
+
+def collect_arm_ids(obj):
+    found = set()
+
+    def walk(node):
+        if isinstance(node, str):
+            candidate = node.strip().rstrip("/")
+            if ARM_ID_RE.match(candidate):
+                found.add(candidate)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return found
 
 
 def norm_key(key):
@@ -559,11 +637,25 @@ def enrich(row, ctx):
     else:
         policy_status = N_A
 
-    backup_status = N_A
-    if rid.lower() in ctx["backup_ids"]:
-        backup_status = "Protected (Azure Backup)"
-    elif (rtype or "").lower() == "microsoft.recoveryservices/vaults":
+    rid_lower = rid.lower()
+    rtype_lower = (rtype or "").lower()
+    backup_status = None
+    if rid_lower in ctx["backup_map"]:
+        backup_status = ctx["backup_map"][rid_lower]
+    elif rtype_lower in PLATFORM_BACKUP:
+        backup_status = PLATFORM_BACKUP[rtype_lower]
+    elif rtype_lower == "microsoft.recoveryservices/vaults":
         backup_status = "Recovery Services vault"
+    else:
+        backup_status = N_A
+
+    logging_signals = []
+    diag_label = ctx["logging_map"].get(rid_lower)
+    if diag_label:
+        logging_signals.append(diag_label)
+    if rid_lower in ctx["agent_monitored"]:
+        logging_signals.append("Monitoring agent extension")
+    logging_status = " + ".join(logging_signals) if logging_signals else "Not detected"
 
     record = {
         "Azure Resource ID": rid,
@@ -599,9 +691,7 @@ def enrich(row, ctx):
         "Tag Compliance Status": tag_compliance(tags, ctx["required_tags"]),
         "Policy Compliance Status": policy_status,
         "Encryption Status": encryption_status(rtype, props, props_json.lower()),
-        "Logging and Monitoring Status": (
-            "Diagnostic settings enabled" if rid.lower() in ctx["diag_parents"] else "Not detected"
-        ),
+        "Logging and Monitoring Status": logging_status,
         "Backup / Recovery Status": backup_status,
         "Inventory Last Refreshed": ctx["refreshed_at"],
     }
@@ -685,36 +775,167 @@ def fetch_subscription_metadata(client, subscriptions):
     return names, mg_map
 
 
-def fetch_diagnostic_parent_ids(client, subscriptions):
-    query = "resources | where type =~ 'microsoft.insights/diagnosticsettings' | project id"
-    parents = set()
-    for row in run_arg_query(client, query, subscriptions):
-        parent = re.sub(
-            r"/providers/microsoft\.insights/diagnosticsettings/[^/]+$",
-            "",
-            row.get("id", ""),
-            flags=re.I,
+def _diag_eligible(rtype):
+    t = (rtype or "").lower()
+    if not t or "diagnosticsettings" in t or "/extensions/" in t:
+        return False
+    if t.rsplit("/", 1)[-1] in ("extensions", "providers"):
+        return False
+    return t.startswith(DIAG_CAPABLE_PREFIXES)
+
+
+def _classify_diag_collection(collection):
+    best = None
+    for setting in collection:
+        logs = any(getattr(entry, "enabled", False) for entry in (getattr(setting, "logs", None) or []))
+        metrics = any(getattr(entry, "enabled", False) for entry in (getattr(setting, "metrics", None) or []))
+        if logs:
+            return "Diagnostic settings (logs)"
+        if metrics and best is None:
+            best = "Diagnostic settings (metrics only)"
+    return best
+
+
+def fetch_logging_signals(credential, rows, workers=8):
+    from azure.mgmt.monitor import MonitorManagementClient
+
+    eligible = [r for r in rows if _diag_eligible(r.get("type"))]
+    vms = [r for r in rows if (r.get("type") or "").lower() == "microsoft.compute/virtualmachines"]
+    print(f"  probing {len(eligible)} diag-capable resources + {len(vms)} VMs "
+          f"for monitoring signals ({workers} workers)...", file=sys.stderr)
+
+    clients = {}
+    clients_lock = threading.Lock()
+
+    def monitor_client(subscription_id):
+        with clients_lock:
+            if subscription_id not in clients:
+                clients[subscription_id] = MonitorManagementClient(credential, subscription_id)
+            return clients[subscription_id]
+
+    logging_map = {}
+    dcr_capable = hasattr(MonitorManagementClient, "data_collection_rule_associations")
+    lock = threading.Lock()
+
+    def probe(resource):
+        rid = resource["id"]
+        sub = resource.get("subscriptionId")
+        label = None
+        try:
+            collection = monitor_client(sub).diagnostic_settings.list(resource_uri=rid)
+            label = _classify_diag_collection(collection)
+        except Exception:
+            pass
+        if label is None and dcr_capable:
+            try:
+                associations = list(
+                    monitor_client(sub).data_collection_rule_associations.list_by_resource(resource_uri=rid)
+                )
+                if associations:
+                    label = "Data collection rule (monitor agent)"
+            except Exception:
+                pass
+        if label:
+            with lock:
+                logging_map[rid.lower()] = label
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(probe, r) for r in eligible + vms]
+        done = 0
+        for future in as_completed(futures):
+            future.result()
+            done += 1
+            if done % 250 == 0:
+                print(f"  probed {done}/{len(futures)}...", file=sys.stderr)
+    return logging_map
+
+
+def detect_agent_monitored(rows):
+    monitored_parents = set()
+    for row in rows:
+        rtype = (row.get("type") or "").lower()
+        if not (rtype.endswith("/extensions") or rtype.endswith("/machines/extensions")):
+            continue
+        blob = (
+            str(row.get("name") or "") + " "
+            + json.dumps(row.get("properties") or {}, default=str)
+        ).lower()
+        has_agent = any(marker in blob for marker in MONITOR_AGENT_MARKERS) or any(
+            publisher in blob for publisher in MONITOR_PUBLISHERS
         )
-        if parent:
-            parents.add(parent.lower())
-    return parents
+        if has_agent:
+            parent = parent_resource_id(row.get("id") or "")
+            if parent:
+                monitored_parents.add(parent.lower())
+    return monitored_parents
 
 
-def fetch_backup_source_ids(client, subscriptions):
+def fetch_backup_map(client, credential, rows, subscriptions=None):
+    backup_labels = {}
+
     query = (
-        "resources | where type =~ 'microsoft.recoveryservices/vaults/backupprotecteditems' "
+        "resources | where type =~ 'microsoft.compute/restorepointcollections' "
+        "or type =~ 'microsoft.recoveryservices/vaults/backupprotecteditems' "
         "| project id, properties"
     )
-    ids = set()
-    for row in run_arg_query(client, query, subscriptions):
-        props = row.get("properties") or {}
-        blob = json.dumps(props, default=str)
-        for match in SOURCE_RESOURCE_ID_RE.findall(blob):
-            ids.add(match.lower())
-        vm_id = (props.get("virtualMachineId") or props.get("sourceResourceId") or "")
-        if vm_id:
-            ids.add(str(vm_id).lower())
-    return ids
+    try:
+        for row in run_arg_query(client, query, subscriptions):
+            source_ids = collect_arm_ids(row.get("properties") or {})
+            for source_id in source_ids:
+                backup_labels.setdefault(source_id.lower(), "Azure Backup")
+    except Exception as exc:
+        print(f"  Graph backup signal failed ({exc}); relying on vault API.", file=sys.stderr)
+    graph_hits = len(backup_labels)
+
+    vaults = [
+        {"id": r["id"], "name": r.get("name"), "rg": r.get("resourceGroup"), "sub": r.get("subscriptionId")}
+        for r in rows if (r.get("type") or "").lower() == "microsoft.recoveryservices/vaults"
+    ]
+    if vaults:
+        try:
+            from azure.mgmt.recoveryservicesbackup import RecoveryServicesBackupClient
+
+            sdk_clients = {
+                v["sub"]: RecoveryServicesBackupClient(credential, v["sub"])
+                for v in {v["sub"] for v in vaults}
+            }
+
+            def probe_vault(vault):
+                labels = {}
+                page = sdk_clients[vault["sub"]].backup_protected_items.list(
+                    vault_name=vault["name"], resource_group_name=vault["rg"]
+                )
+                for item in page:
+                    props = getattr(item, "properties", None)
+                    if props is None:
+                        continue
+                    try:
+                        blob = props.as_dict()
+                    except Exception:
+                        blob = {}
+                    workload = (blob.get("workload_type")
+                                or blob.get("protected_item_type")
+                                or "item")
+                    for source_id in collect_arm_ids(blob):
+                        labels.setdefault(source_id.lower(), f"Azure Backup ({workload})")
+                return labels
+
+            with ThreadPoolExecutor(max_workers=min(8, len(vaults))) as pool:
+                futures = {pool.submit(probe_vault, v): v for v in vaults}
+                for future in as_completed(futures):
+                    try:
+                        for rid_lower, label in future.result().items():
+                            backup_labels[rid_lower] = label
+                    except Exception as exc:
+                        vault = futures[future]
+                        print(f"  vault '{vault['name']}' probe failed: {exc}", file=sys.stderr)
+        except ImportError:
+            print("  azure-mgmt-recoveryservicesbackup not installed; "
+                  "vault-level backup lookup skipped.", file=sys.stderr)
+
+    print(f"  backup sources: {graph_hits} via restore points/items, "
+          f"{len(backup_labels)} total after vault scan", file=sys.stderr)
+    return backup_labels
 
 
 def fetch_policy_compliance(client, subscriptions):
@@ -796,6 +1017,9 @@ def parse_args(argv=None):
         help="Skip fetching resource properties; VNet/NSG/public-access/encryption fields become N/A",
     )
     parser.add_argument("--skip-policy", action="store_true", help="Skip policy compliance lookup")
+    parser.add_argument("--skip-backup", action="store_true", help="Skip backup coverage lookup")
+    parser.add_argument("--skip-logging", action="store_true", help="Skip diagnostic settings probe")
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent API workers (default 8)")
     return parser.parse_args(argv)
 
 
@@ -831,11 +1055,22 @@ def main(argv=None):
     print("Fetching subscription / management group metadata...", flush=True)
     sub_names, sub_mg = fetch_subscription_metadata(client, subscriptions)
 
-    print("Fetching diagnostic settings...", flush=True)
-    diag_parents = fetch_diagnostic_parent_ids(client, subscriptions)
+    backup_map = {}
+    if not args.skip_backup:
+        print("Resolving backup coverage (restore points + vault protected items)...", flush=True)
+        try:
+            backup_map = fetch_backup_map(client, credential, rows, subscriptions)
+        except Exception as exc:
+            print(f"  Backup lookup failed ({exc}); column will be N/A.", file=sys.stderr)
 
-    print("Fetching backup protected items...", flush=True)
-    backup_ids = fetch_backup_source_ids(client, subscriptions)
+    logging_map, agent_monitored = {}, set()
+    if not args.skip_logging:
+        print("Probing diagnostic settings and agent signals...", flush=True)
+        try:
+            logging_map = fetch_logging_signals(credential, rows, args.workers)
+        except Exception as exc:
+            print(f"  Logging probe failed ({exc}); column degrades to agents only.", file=sys.stderr)
+        agent_monitored = detect_agent_monitored(rows)
 
     policy = {}
     if not args.skip_policy:
@@ -849,8 +1084,9 @@ def main(argv=None):
     ctx = {
         "sub_names": sub_names,
         "sub_mg": sub_mg,
-        "diag_parents": diag_parents,
-        "backup_ids": backup_ids,
+        "logging_map": logging_map,
+        "agent_monitored": agent_monitored,
+        "backup_map": backup_map,
         "policy": policy,
         "tenant": resolve_tenant(credential, rows),
         "required_tags": required_tags,

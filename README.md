@@ -57,8 +57,8 @@ directory; override with `-o /path/to/basename`.
 | Tag Compliance Status | Required tags present? Alias-aware (`env` satisfies `Environment`) |
 | Policy Compliance Status | ARG `policyresources` policy states (worst state wins) |
 | Encryption Status | Per-type: storage keySource, disk encryption type, CMK references |
-| Logging & Monitoring | Presence of diagnostic settings on the resource |
-| Backup / Recovery | Source IDs of Recovery Services protected items |
+| Logging & Monitoring | Three signals: diagnostic settings via Monitor API (log vs metric categories), data-collection-rule associations, and monitoring-agent extensions detected in the inventory itself |
+| Backup / Recovery | Restore point collection sources (Graph) + per-vault protected-item scan (disks, VMs, SQL/HANA workloads) + platform-built-in backups (SQL PaaS, Cosmos DB, PG/MySQL Flexible) |
 | Inventory Last Refreshed | Run timestamp |
 
 Anything not determinable is `N/A`.
@@ -82,5 +82,7 @@ Edit at the top of `azure_inventory.py`:
   state (`Succeeded`), not Running/Stopped.
 - Large estates: if you hit payload errors the script auto-halves page size;
   you can also start smaller with `--page-size 50`.
-- Diagnostic settings are checked as a single extra Graph query (no per-resource
-  API calls), so it covers ARM-level diagnostic settings only.
+- Diagnostic settings are probed live via the Azure Monitor API for known
+  diag-capable types (Resource Graph does not index them); tune with
+  `--workers` / `--skip-logging`. Backup truth combines restore point
+  collections, per-vault protected-item scans, and platform-native backup rules.
