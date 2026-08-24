@@ -3,6 +3,10 @@
 Deep-dive into how `azure_inventory.py` works end-to-end: data sources, query
 strategy, enrichment algorithms, error handling, and design trade-offs.
 
+> For the exact decision logic inside each derived value (encryption tree,
+> backup priority chain, logging signal composition, tag compliance ladder,
+> …), see [CALCULATIONS.md](CALCULATIONS.md).
+
 ---
 
 ## Table of contents

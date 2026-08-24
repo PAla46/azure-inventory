@@ -5,6 +5,9 @@ credentials can see, exported to CSV and/or Excel. Built on **Azure Resource
 Graph** (single query across all subscriptions), enriched locally with derived
 governance, networking, security, and operations attributes.
 
+> **Docs:** [ARCHITECTURE.md](ARCHITECTURE.md) — system design and data flow ·
+> [CALCULATIONS.md](CALCULATIONS.md) — exact decision logic behind every derived field
+
 ## Setup
 
 ```bash
